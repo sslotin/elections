@@ -18,23 +18,14 @@ import argparse
 import json
 import sys
 import threading
-import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
-import requests
+from portal import API, FEDERAL_COLUMNS, Portal, add_cache_arguments, collect_federal_metadata
 
-API = "https://stat.vybory.gov.ru/api"
 MSK = timezone(timedelta(hours=3))
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/140.0 Safari/537.36"
-    )
-}
 PRINT_LOCK = threading.Lock()
 
 
@@ -48,46 +39,8 @@ def log(message: str) -> None:
         print(message, file=sys.stderr, flush=True)
 
 
-class Portal:
-    def __init__(self, cache_dir: Path, workers: int = 8, base: str = API) -> None:
-        self.cache_dir = cache_dir
-        self.base = base.rstrip("/")
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        self.pool = ThreadPoolExecutor(workers)
-        self.calls = 0
-        self.cache_hits = 0
-
-    def path_to_file(self, path: str) -> Path:
-        safe = "".join(character if character.isalnum() or character in "-." else "_" for character in path)
-        return self.cache_dir / f"{safe[:180]}.json"
-
-    def get(self, path: str, attempts: int = 4):
-        cached = self.path_to_file(path)
-        if cached.exists():
-            self.cache_hits += 1
-            return json.loads(cached.read_text())
-        last_error: Exception | None = None
-        for attempt in range(attempts):
-            try:
-                response = self.session.get(f"{self.base}/{path}", timeout=45)
-                if response.status_code == 200:
-                    payload = response.json()
-                    cached.write_text(json.dumps(payload, ensure_ascii=False))
-                    self.calls += 1
-                    return payload
-                last_error = RuntimeError(f"HTTP {response.status_code} for {path}")
-            except Exception as error:  # noqa: BLE001 - retried below
-                last_error = error
-            time.sleep(1.0 + attempt)
-        raise RuntimeError(f"failed to fetch {path}: {last_error}")
-
-    def get_many(self, paths: list[str]) -> list:
-        return list(self.pool.map(self.get, paths))
-
-
-def collect_metadata(portal: Portal) -> tuple[dict, dict, dict]:
+def collect_metadata(portal: Portal, *, federal_details: dict | None = None,
+                     include_federal: bool = True) -> tuple[dict, dict, dict]:
     """Return (map_contracts, map_regions, counters)."""
     regions = portal.get("voting/regions")["data"]["regions"]
     map_regions = {region["code"]: (region["name"], region["description"]) for region in regions}
@@ -124,6 +77,14 @@ def collect_metadata(portal: Portal) -> tuple[dict, dict, dict]:
                 data["districtName"],
             )
             counters[contract_id] = voting["counters"]
+    if include_federal:
+        details, federal_counters = collect_federal_metadata(portal)
+        for contract, row in details.items():
+            map_contracts[contract] = (row["region"], row["election"], row["district"])
+        counters.update(federal_counters)
+        if federal_details is not None:
+            federal_details.update(details)
+        log(f"federal contracts with metadata: {len(details)}")
     log(f"contracts with metadata: {len(map_contracts)}")
     return map_contracts, map_regions, counters
 
@@ -315,6 +276,9 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cache", type=Path, default=None, help="API response cache (default: OUT/cache)")
     parser.add_argument("--workers", type=int, default=8)
+    add_cache_arguments(parser)
+    parser.add_argument("--skip-federal", action="store_true",
+                        help="skip federal API v2 (e.g. for older/training portals)")
     parser.add_argument(
         "--api",
         default=API,
@@ -322,17 +286,27 @@ def main() -> int:
     )
     parser.add_argument("--skip-api", action="store_true", help="build only dump-derived tables")
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
 
     out_dir = args.out.resolve()
     cache_dir = args.cache or out_dir / "cache"
 
+    federal_details = {}
     if args.skip_api:
         map_contracts, map_regions, results, counters = {}, {}, {}, {}
     else:
-        portal = Portal(cache_dir, args.workers, args.api)
-        map_contracts, map_regions, counters = collect_metadata(portal)
-        results = collect_results(portal, sorted(map_contracts))
-        log(f"API calls: {portal.calls}, cache hits: {portal.cache_hits}")
+        with Portal(cache_dir, args.workers, args.api, args.cache_ttl, args.refresh_cache) as portal:
+            map_contracts, map_regions, counters = collect_metadata(
+                portal, federal_details=federal_details, include_federal=not args.skip_federal,
+            )
+            # No results exist yet for active federal votings. Avoid querying
+            # their result endpoint before the metadata says they are published.
+            result_contracts = [contract for contract in map_contracts
+                                if contract not in federal_details
+                                or federal_details[contract]["has_results"] is not False]
+            results = collect_results(portal, sorted(result_contracts))
+            log(f"API calls: {portal.calls}, cache hits: {portal.cache_hits}")
 
     log(f"parsing dump {args.dump}")
     ballots, votes, voter_lists, tallies, contract_regions, stats = parse_dump(args.dump)
@@ -354,6 +328,11 @@ def main() -> int:
         contract_regions,
     )
     log(f"wrote {counts} into {out_dir}")
+    # Keep the established elections.csv schema; expose the additional identity
+    # fields separately so SINGLE and UNION contracts are never joined by name.
+    pd.DataFrame(
+        [federal_details[key] for key in sorted(federal_details)], columns=FEDERAL_COLUMNS,
+    ).to_csv(out_dir / "federal_contracts.csv", index=False)
 
     if counters:
         issued = sum(c["issued"] for c in counters.values())

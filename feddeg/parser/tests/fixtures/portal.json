@@ -1,0 +1,310 @@
+{
+  "elections?level=FEDERAL": {
+    "data": {
+      "level": "FEDERAL",
+      "elections": [
+        {
+          "electionId": "01a0b0bc-e057-761b-a6a0-a89eeb4d4258",
+          "electionName": "Выборы депутатов Государственной Думы Федерального Собрания Российской Федерации девятого созыва",
+          "sortLevel": 12,
+          "electionKind": "ZAKS",
+          "regions": [
+            {
+              "code": 49,
+              "name": "MAGADAN_OBLAST",
+              "description": "Магаданская область"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "statistics/v2/election/01a0b0bc-e057-761b-a6a0-a89eeb4d4258": {
+    "data": {
+      "electionLevel": "FEDERAL",
+      "electionKind": "ZAKS",
+      "electionName": "Выборы депутатов Государственной Думы Федерального Собрания Российской Федерации девятого созыва",
+      "collectionTime": "18.09.2026 14:05:14",
+      "votings": [
+        {
+          "type": "SINGLE",
+          "hasResults": false,
+          "counters": {
+            "all": 4046186,
+            "issued": 2284475,
+            "voted": 2251781,
+            "failedVoted": 0
+          }
+        },
+        {
+          "type": "UNION",
+          "hasResults": false,
+          "counters": {
+            "all": 4046183,
+            "issued": 2284464,
+            "voted": 2267178,
+            "failedVoted": 0
+          }
+        }
+      ],
+      "regions": [
+        {
+          "code": 49,
+          "name": "MAGADAN_OBLAST",
+          "description": "Магаданская область",
+          "orderField": 55
+        }
+      ]
+    }
+  },
+  "statistics/v2/election/region?electionId=01a0b0bc-e057-761b-a6a0-a89eeb4d4258&regionCode=49": {
+    "data": {
+      "electionLevel": "FEDERAL",
+      "electionKind": "ZAKS",
+      "electionName": "Выборы депутатов Государственной Думы Федерального Собрания Российской Федерации девятого созыва",
+      "collectionTime": "18.09.2026 14:06:09",
+      "regionCode": 49,
+      "regionName": "MAGADAN_OBLAST",
+      "regionDescription": "Магаданская область",
+      "votings": [
+        {
+          "type": "SINGLE",
+          "hasResults": false,
+          "counters": {
+            "all": 8198,
+            "issued": 5680,
+            "voted": 5345,
+            "failedVoted": 0
+          }
+        },
+        {
+          "type": "UNION",
+          "hasResults": false,
+          "counters": {
+            "all": 8198,
+            "issued": 5680,
+            "voted": 5370,
+            "failedVoted": 0
+          }
+        }
+      ],
+      "districts": [
+        {
+          "id": "dabfe3b5-f337-468f-9b36-822cf491242c",
+          "createdAt": "17.09.2026 21:58",
+          "number": 117,
+          "name": "Магаданская область – Магаданский",
+          "regionCode": 49
+        }
+      ]
+    }
+  },
+  "statistics/v2/election/district?electionId=01a0b0bc-e057-761b-a6a0-a89eeb4d4258&districtId=dabfe3b5-f337-468f-9b36-822cf491242c": {
+    "data": {
+      "electionLevel": "FEDERAL",
+      "electionKind": "ZAKS",
+      "electionName": "Выборы депутатов Государственной Думы Федерального Собрания Российской Федерации девятого созыва",
+      "collectionTime": "18.09.2026 22:06:58",
+      "regionCode": 49,
+      "regionName": "MAGADAN_OBLAST",
+      "regionDescription": "Магаданская область",
+      "districtId": "dabfe3b5-f337-468f-9b36-822cf491242c",
+      "districtName": "Магаданская область – Магаданский",
+      "districtNumber": 117,
+      "votings": [
+        {
+          "type": "SINGLE",
+          "hasResults": false,
+          "counters": {
+            "all": 8198,
+            "issued": 5681,
+            "voted": 5346,
+            "failedVoted": 0
+          }
+        },
+        {
+          "type": "UNION",
+          "hasResults": false,
+          "counters": {
+            "all": 8198,
+            "issued": 5681,
+            "voted": 5372,
+            "failedVoted": 0
+          }
+        }
+      ],
+      "tiks": [
+        {
+          "tikId": "6821e4d7-33ea-4e54-934d-85e239f8ba0e",
+          "tikName": "Арманская"
+        }
+      ]
+    }
+  },
+  "statistics/v2/election/tik?electionId=01a0b0bc-e057-761b-a6a0-a89eeb4d4258&districtId=dabfe3b5-f337-468f-9b36-822cf491242c&tikId=6821e4d7-33ea-4e54-934d-85e239f8ba0e": {
+    "data": {
+      "electionLevel": "FEDERAL",
+      "electionKind": "ZAKS",
+      "electionName": "Выборы депутатов Государственной Думы Федерального Собрания Российской Федерации девятого созыва",
+      "collectionTime": "18.09.2026 22:07:24",
+      "districtId": "dabfe3b5-f337-468f-9b36-822cf491242c",
+      "districtName": "Магаданская область – Магаданский",
+      "districtNumber": 117,
+      "regionCode": 49,
+      "regionName": "MAGADAN_OBLAST",
+      "regionDescription": "Магаданская область",
+      "tikId": "6821e4d7-33ea-4e54-934d-85e239f8ba0e",
+      "tabulationCommissionExternalId": "854696155663105503",
+      "tikName": "Арманская",
+      "timeOffset": 8,
+      "votings": [
+        {
+          "contractId": "FJBmtZm6wMJHFk91niNGoaKwPanyQew2XXD2VY5BXTPJ",
+          "status": "IN_PROCESS",
+          "clientStartDateTime": "18.09.2026 08:00",
+          "clientEndDateTime": "20.09.2026 20:00",
+          "ballotAcceptanceEndDate": "20.09.2026 20:15",
+          "type": "SINGLE",
+          "commissionId": "ce4d36d8-5568-4100-bd46-b71a3d593233",
+          "hasResults": false,
+          "counters": {
+            "all": 57,
+            "issued": 30,
+            "voted": 29
+          }
+        },
+        {
+          "contractId": "7CYkHDzJvkFvbBtiFj7mtB5zfRAqP59kpGtd4TxAaJwp",
+          "status": "IN_PROCESS",
+          "clientStartDateTime": "18.09.2026 08:00",
+          "clientEndDateTime": "20.09.2026 20:00",
+          "ballotAcceptanceEndDate": "20.09.2026 20:15",
+          "type": "UNION",
+          "commissionId": "ce4d36d8-5568-4100-bd46-b71a3d593233",
+          "hasResults": false,
+          "counters": {
+            "all": 57,
+            "issued": 30,
+            "voted": 29
+          }
+        }
+      ]
+    }
+  },
+  "statistics/chart/hourly?contractIds=CJ9vdyteoijMZrUXjhfTymUGP6JMvtKppdQ9ZxHKNoPc": {
+    "data": [
+      {
+        "contractId": "CJ9vdyteoijMZrUXjhfTymUGP6JMvtKppdQ9ZxHKNoPc",
+        "plannedStartDateTime": "18.09.2026 08:00",
+        "plannedEndDateTime": "20.09.2026 20:59",
+        "timeOffset": 0,
+        "points": [
+          {
+            "dateTime": "18.09.2026 08:00",
+            "metrics": {
+              "countVote": 0,
+              "countBlindSign": 0,
+              "totalCountVote": 0,
+              "totalCountBlindSign": 0
+            }
+          },
+          {
+            "dateTime": "18.09.2026 09:00",
+            "metrics": {
+              "countVote": 8,
+              "countBlindSign": 9,
+              "totalCountVote": 8,
+              "totalCountBlindSign": 9
+            }
+          },
+          {
+            "dateTime": "18.09.2026 10:00",
+            "metrics": {
+              "countVote": 12,
+              "countBlindSign": 13,
+              "totalCountVote": 20,
+              "totalCountBlindSign": 22
+            }
+          },
+          {
+            "dateTime": "18.09.2026 11:00",
+            "metrics": {
+              "countVote": 15,
+              "countBlindSign": 16,
+              "totalCountVote": 35,
+              "totalCountBlindSign": 38
+            }
+          },
+          {
+            "dateTime": "18.09.2026 12:00",
+            "metrics": {
+              "countVote": 10,
+              "countBlindSign": 9,
+              "totalCountVote": 45,
+              "totalCountBlindSign": 47
+            }
+          },
+          {
+            "dateTime": "18.09.2026 13:00",
+            "metrics": {
+              "countVote": 4,
+              "countBlindSign": 6,
+              "totalCountVote": 49,
+              "totalCountBlindSign": 53
+            }
+          },
+          {
+            "dateTime": "18.09.2026 14:00",
+            "metrics": {
+              "countVote": 0,
+              "countBlindSign": 0
+            }
+          },
+          {
+            "dateTime": "18.09.2026 15:00",
+            "metrics": {
+              "countVote": 0,
+              "countBlindSign": 0
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "statistics/voting/uiks/search": {
+    "data": {
+      "collectionTime": "18 сентября, 14:07:36 мск",
+      "distributionByPrimaryUikNumbers": {
+        "results": [
+          {
+            "primaryUikNumber": 316,
+            "all": 28,
+            "issued": 17,
+            "turnoutPercent": 60.71
+          },
+          {
+            "primaryUikNumber": 317,
+            "all": 57,
+            "issued": 34,
+            "turnoutPercent": 59.65
+          },
+          {
+            "primaryUikNumber": 318,
+            "all": 14,
+            "issued": 9,
+            "turnoutPercent": 64.29
+          },
+          {
+            "primaryUikNumber": 319,
+            "all": 4,
+            "issued": 2,
+            "turnoutPercent": 50.0
+          }
+        ],
+        "totalCount": 4,
+        "empty": false,
+        "present": true
+      }
+    }
+  }
+}
