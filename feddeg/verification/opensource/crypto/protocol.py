@@ -2,8 +2,8 @@
 
 For every voting of the export the observer checks:
 
-1. the transaction signature S.Verify (GOST R 34.10-2012) of every transaction
-   that the smart contract accepted (§4.4.1);
+1. the transaction signature S.Verify (GOST R 34.10-2012) of every exported
+   contract request, including contract-rejected requests (§4.4.1);
 2. the blind signature BS.Verify of the voter's key on every bulletin (§4.4.1);
 3. the shape of the bulletin: `dimension` cells (t options), 𝑚ᵢ ∈ {0,1} and
    min ≤ Σ𝑚ᵢ ≤ max (§4.2.2, §4.4.1);
@@ -18,8 +18,51 @@ For every voting of the export the observer checks:
 9. the aggregation SE.DecAgg → results, compared with the published RESULTS
    (§4.5.4/§4.7).
 
-Counting follows the protocol's notion of an accepted ballot: the vote
-transactions whose state writes carry VOTE_<key> and no FAIL_* marker.
+Sources and independent-review map
+----------------------------------
+Start with ../../protocol/protocol2023.pdf §4.6, then §2.2 (gost3410.py), §2.3
+(tezhu.py), §2.4 (zkp.py, elgamal.py). Those modules cite the original papers,
+state the precise wire encodings, and map equations to code. The voting-system
+construction is explained by Cramer, Gennaro & Schoenmakers, "A Secure and
+Optimally Efficient Multi-Authority Election Scheme", EUROCRYPT '97, §§2–3:
+https://crypto.ethz.ch/publications/files/CrGeSc97b.pdf
+The papers justify building blocks under assumptions; they do NOT certify
+this deployment. Read the raster formulas in the PDF: text extraction omits
+important algorithms. Known differences from those formulas are explicitly
+recorded in zkp.py and elgamal.py; `verified` means the implemented export
+profile passed, NOT exact PDF conformance or a whole-election security proof.
+
+Trace the whole acceptance chain in this order:
+1. Replay accepted configuration writes; validate dimension=[min,max,t] with
+   integer 0<=min<=max<=t and t>0. Authenticate the expected authority keys
+   and election identifier out of band; otherwise checks use attacker-chosen
+   parameters. Voting configuration is assumed immutable once ballots start.
+2. Reconstruct the signed transaction bytes, check S.Verify, then BS.Verify
+   over the voter's Base58 key STRING. These are independent signatures.
+3. Counting follows exported state: operation=vote, rollback != '-1', no FAIL
+   marker, and a VOTE_<sender> write. Reject duplicate accepted sender keys;
+   do not merely count the number of vote requests or silently drop failures.
+   This uniqueness check is a protocol rule (§4.4.2), not a cryptographic proof.
+4. Decode each question with exactly t option cells. Check each option's {0,1}
+   proof, the [min,max] proof, AND A_sum=sum(A_i), B_sum=sum(B_i). Otherwise an
+   unrelated valid sum proof says nothing about this ballot's number of choices.
+5. Check MAIN_KEY = KeyAgg(DKG_KEY,COMMISSION_KEY) using production coefficients.
+   Sum EVERY accepted, verified ballot, not just a sample. Require all declared
+   cells from both authorities, and verify both decryption proofs with pollId.
+6. Unweight/subtract partials, recover each m in [0,accepted], compare every
+   RESULTS cell and its shape. Failed/missing proofs or partial coverage may
+   never produce a full `verified` verdict. results-only deliberately provides
+   weaker evidence; record every disabled check, including sum linkage.
+
+Trust boundary: request signatures do NOT cover exported state diffs, FAIL/
+VOTE markers or block membership. We do not replay smart-contract execution,
+verify consensus/block signatures, prove completeness/availability of exports,
+check voter-roll eligibility or one blind-signature issuance per person, audit
+DKG/secret sharing/commitments, prove honest randomness, or establish privacy,
+coercion resistance or issuer unlinkability. Those parts of the PDF need
+separate evidence. Empty-election decryption encodings remain unsupported and
+must yield incomplete, not successful, verification. See AUDIT.md for a
+reproducible review sequence and tests; synthetic tests are not security proofs.
 """
 
 from __future__ import annotations
@@ -85,6 +128,9 @@ class AuditResult:
     accepted: int = 0
     rejected: int = 0
     valid_bulletins: int = 0
+    # In results-only mode, prior full-audit failures and undecodable ballots
+    # are excluded from the aggregate but reported separately.
+    excluded_ballots: dict[str, str] = field(default_factory=dict)
     wrong_tx_signature: list[str] = field(default_factory=list)
     bad_blind_signature: list[str] = field(default_factory=list)
     bad_shape: list[str] = field(default_factory=list)
@@ -118,8 +164,10 @@ class AuditResult:
         full audit, so ``verdict`` remains ``incomplete`` even when both
         decryption proofs and the final tally are correct.
         """
+        included_expected = self.accepted - len(self.excluded_ballots)
         return (not self.error and not self.sampled and
-                self.checked_ballots == self.accepted == self.valid_bulletins and
+                self.checked_ballots == self.accepted and
+                self.valid_bulletins == included_expected and
                 self.key_aggregation_ok is True and
                 self.results_match is True and
                 set(self.partial_decryption_ok) == {"Учетчик", "Комиссия"} and
@@ -132,12 +180,9 @@ class AuditResult:
                 self.key_aggregation_ok is False or self.results_match is False or
                 any(value is False for value in self.partial_decryption_ok.values())):
             return "failed"
-        if (self.sampled or not all(self.enabled_checks.get(name, False) for name in
-                ("tx_signatures", "blind_signatures", "range_proofs")) or
-                self.checked_ballots != self.accepted or
-                self.key_aggregation_ok is not True or self.results_match is not True or
-                set(self.partial_decryption_ok) != {"Учетчик", "Комиссия"} or
-                any(value is not True for value in self.partial_decryption_ok.values())):
+        if (not self.final_result_verified or not all(
+                self.enabled_checks.get(name, False) for name in
+                ("tx_signatures", "blind_signatures", "range_proofs", "ballot_structure"))):
             return "incomplete"
         return "verified"
 
@@ -148,6 +193,9 @@ class AuditResult:
         lines.append(f"  verdict: {self.verdict}; ballot coverage: {self.checked_ballots}/{self.accepted}"
                      f"; sampled: {self.sampled}; enabled checks: {self.enabled_checks}")
         lines.append(f"  действительных бюллетеней: {self.valid_bulletins}")
+        if self.excluded_ballots:
+            lines.append(f"  исключено бюллетеней: {len(self.excluded_ballots)}")
+            lines.extend(f"    {tx_id}: {reason}" for tx_id, reason in sorted(self.excluded_ballots.items()))
         if self.enabled_checks.get("range_proofs"):
             per_ballot = (self.ballot_zkp_seconds / self.valid_bulletins
                           if self.valid_bulletins else 0.0)
@@ -277,6 +325,12 @@ INPUT_ERRORS = (ValueError, TypeError, KeyError, IndexError, OverflowError)
 
 def _ballot(tx, main_key, blind_key, dimension, result, dst, check_proofs,
             check_blind_signatures, check_structure=True):
+    """§4.5.3: BS authorization, shape, sum linkage, then every OR proof.
+
+    Only return ciphertexts after all enabled checks pass. Sum linkage and
+    membership are distinct: neither may substitute for the other. See the
+    module checklist and tests/test_crypto.py::test_range_proof_and_linkage.
+    """
     if check_blind_signatures:
         try:
             signature = _binary(tx.param("blindSig"))
@@ -341,7 +395,7 @@ def audit(path: Path, *, verify_tx_signatures: bool = True, dst: bytes = DST_BLI
     path = Path(path)
     result = AuditResult(contract=contract_id(path), enabled_checks={
         "tx_signatures": verify_tx_signatures, "range_proofs": check_proofs,
-        "blind_signatures": check_blind_signatures})
+        "blind_signatures": check_blind_signatures, "ballot_structure": check_structure})
     try:
         _audit(path, result, verify_tx_signatures, dst, max_votes, check_proofs,
                check_blind_signatures, check_structure)

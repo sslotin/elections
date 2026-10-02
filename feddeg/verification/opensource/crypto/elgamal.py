@@ -1,8 +1,17 @@
 """SE — гомоморфное сложение, агрегирование ключей и расшифрование (§2.4).
 
-The protocol defines the scheme by its interfaces only:
-`SE.KeyAgg(pk₁, pk₂)`, `SE.Add((c₁),…,(cₙ))`, `SE.DecAgg(c̄, μ₁, μ₂, pk₁, pk₂)`.
-The concrete arithmetic of the ElGamal variant over ℰ is:
+Sources:
+* ElGamal, "A Public Key Cryptosystem and a Signature Scheme Based on Discrete
+  Logarithms", IEEE TIT 31(4), 1985, https://doi.org/10.1109/TIT.1985.1057074
+  (encryption, not the ElGamal signature algorithm).
+* Cramer, Gennaro & Schoenmakers, "A Secure and Optimally Efficient
+  Multi-Authority Election Scheme", EUROCRYPT '97, §§2.3–2.6 and 3:
+  https://crypto.ethz.ch/publications/files/CrGeSc97b.pdf — exponential ElGamal,
+  homomorphic tallying, proofs of valid votes and partial decryptions.
+* ../../protocol/protocol2023.pdf §2.4, raster formulas 05, 10, 15 in
+  ../../protocol/protocol2023-assets/ — the scheme-specific key weights.
+
+The production arithmetic is (G is the PDF's generator P):
 
     KeyAgg:  pk = h(pk₁‖pk₂)·pk₁ + h(pk₂‖pk₁)·pk₂,  h = Hash into ℤ_q
     Add:     (ΣA_i, ΣB_i) componentwise, per cell
@@ -11,9 +20,35 @@ The concrete arithmetic of the ElGamal variant over ℰ is:
              gives the tally v (v ≤ number of accepted ballots, so it is solved
              by enumeration).
 
-The mixing coefficients are not written down in the document; they are the ones
-used by the published implementations (h over the concatenated points, see
-`hashfn.points_hash`).
+Independent derivation: if pk_i=x_i*G and pk=h1*pk1+h2*pk2, one ciphertext
+is A=r*G, B=r*pk+m*G. Componentwise summation gives Abar=(sum r)*G and
+Bbar=(sum r)*pk+(sum m)*G. Authority i publishes P_i=x_i*Abar, which zkp.py
+must verify BEFORE it is trusted. Then Bbar-h1*P_1-h2*P_2=(sum m)*G.
+Use the SAME coefficients, key order and hash encoding in KeyAgg and DecAgg.
+Do not replace them by unweighted key addition or cite a generic multisignature
+paper as a proof of this specific two-key construction.
+
+IMPORTANT PDF discrepancy: the PDF explicitly sets h1=H(pk2||pk1),
+h2=H(pk1||pk2), the OPPOSITE assignment from production above. Its general
+point encoding is LE64; production hashfn.points_hash uses compressed ASCII
+hex. The implemented order is pinned by actual exports and by:
+https://github.com/cikrf/deg2025/blob/d1fc451622342990e436afdc5849e6e9969f62c7/observer-tools/src/worker/index.ts
+(calculateResults), plus src/worker/worker.ts (encryptedSums). Matching those
+sources demonstrates compatibility, not exact PDF conformance or a security
+reduction for the hash-weighted key setup.
+
+Review obligations outside the group equations:
+* Include each accepted voter key once, require identical ballot dimensions,
+  and stop short of certifying a tally if ANY included ballot check fails.
+* Per-option proofs establish m in {0,1}, so each tally lies in [0,N]. Search
+  only this interval, require N<q for uniqueness, compare the FULL point (x
+  alone confuses vG with -vG), preserve duplicate targets, and map infinity to
+  zero. Missing solutions stay None, never zero. Compare the full tally shape
+  and all entries with published RESULTS. A bounded walk uses O(number of
+  target cells) memory, not a table proportional to all ballots.
+* These helpers only do arithmetic. They do not verify proofs, authenticate
+  authority identities, reconstruct DKG, or prove honest key generation.
+  Protocol drivers perform proof checks and track incomplete/failing results.
 """
 
 from __future__ import annotations
@@ -71,7 +106,7 @@ def key_agg(pk1: curve.Point, pk2: curve.Point) -> curve.Point:
     """SE.KeyAgg — the ballot encryption key of a voting (§4.2.3)."""
     h1 = points_hash_mod_q([pk1, pk2])
     h2 = points_hash_mod_q([pk2, pk1])
-    return curve.add(curve.mul(pk1, h1), curve.mul(pk2, h2))
+    return curve.mul_add(h1, pk1, h2, pk2)
 
 
 def add(ciphertexts: list[list[list[Ciphertext]]]) -> list[list[Ciphertext]]:
@@ -86,19 +121,18 @@ def add(ciphertexts: list[list[list[Ciphertext]]]) -> list[list[Ciphertext]]:
              for c in range(count)] for q, count in enumerate(shape)]
 
 
-def dec_agg(summed: list[Ciphertext], partials: list[dict], pk1: curve.Point,
-            pk2: curve.Point) -> list[int]:
-    """SE.DecAgg — the tally per cell from the two partial decryptions."""
+def dec_agg(summed: list[Ciphertext], partials: list[tuple[dict, dict]], pk1: curve.Point,
+            pk2: curve.Point, *, limit: int) -> list[int | None]:
+    """SE.DecAgg arithmetic only; callers must verify partial proofs first."""
+    if len(summed) != len(partials):
+        raise ValueError("partial decryptions do not match ciphertext count")
     h1 = points_hash_mod_q([pk1, pk2])
     h2 = points_hash_mod_q([pk2, pk1])
-    tally = []
-    for cell, (master, commission) in zip(summed, partials):
-        _, b_point = cell
-        p1 = curve.mul(_point(master["P"]), h1)
-        p2 = curve.mul(_point(commission["P"]), h2)
-        value = curve.sub(b_point, curve.add(p1, p2))
-        tally.append(solve_dlp(value, None))
-    return tally
+    targets = [curve.sub(b_point, curve.mul_add(h1, _point(master["P"]),
+                                               h2, _point(commission["P"])))
+               for (_, b_point), (master, commission) in zip(summed, partials)]
+    solved = solve_dlp_batch(targets, limit)
+    return [solved[index] for index in range(len(targets))]
 
 
 def _point(value) -> curve.Point:
@@ -107,27 +141,15 @@ def _point(value) -> curve.Point:
     return curve.decompress(value)
 
 
-def solve_dlp(point: curve.Point, limit: int | None) -> int | None:
-    """Smallest v ≥ 0 with point = v·P (enumeration; tallies are small)."""
-    if point is None:
-        return 0
-    target_x = point[0]
-    cursor: curve.Point = None
-    v = 0
-    while limit is None or v <= limit:
-        if cursor is not None and cursor[0] == target_x and cursor == point:
-            return v
-        cursor = curve.add(cursor, curve.G)
-        v += 1
-        if cursor is None and point is None:
-            return v
-    return None
+def solve_dlp(point: curve.Point, limit: int) -> int | None:
+    """Smallest v in [0,limit] with point=vG; never search without a bound."""
+    return solve_dlp_batch([point], limit)[0]
 
 
 def solve_dlp_batch(points: list[curve.Point | None], limit: int) -> dict[int, int | None]:
     """One linear walk resolved against all targets at once (all tallies share it)."""
-    if limit < 0:
-        raise ValueError("DLP limit must be nonnegative")
+    if type(limit) is not int or not 0 <= limit < curve.Q:
+        raise ValueError("DLP limit must be an integer in [0,q)")
     wanted: dict[curve.Point, list[int]] = {}
     found: dict[int, int | None] = {}
     for index, point in enumerate(points):

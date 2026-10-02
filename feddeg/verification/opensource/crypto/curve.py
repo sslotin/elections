@@ -9,9 +9,16 @@ id-tc26-gost-3410-2012-256-paramSetB, параметры которой опре
 формате little-endian; точки (𝑥, 𝑦) представляются как 𝑏_𝑥‖𝑏_𝑦, где 𝑏_𝑥, 𝑏_𝑦 —
 little-endian представления координат длины 32."
 
-The group arithmetic is implemented here directly — it is modular arithmetic over
-the parameters of the standard, so the verifier depends on no Russian
-cryptographic stack.  Two implementations are kept:
+Parameter sources: RFC 9215 Appendix C identifies paramSetB with the earlier
+CryptoPro-A curve; RFC 4357 §11.4 gives its explicit p,a,b,q,G coordinates:
+https://www.rfc-editor.org/rfc/rfc9215.html#appendix-C
+https://www.rfc-editor.org/rfc/rfc4357.html#section-11.4
+Do not confuse this 256-bit set B with 512-bit set B or 256-bit set A.
+
+Arithmetic references: SEC 1 v2 §2.3 (point encoding), §3.2.2 (key validation),
+https://www.secg.org/sec1-v2.pdf; Bernstein & Lange's Explicit-Formulas Database,
+https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html
+(add-2007-bl and a=-3 doubling). Two readable Python paths are kept:
 
 * the affine one (`*_affine`, one modular inversion per operation) — slow but
   easy to read, used by the self-tests, and
@@ -19,10 +26,40 @@ cryptographic stack.  Two implementations are kept:
   precomputed table for the generator, joint multiplication for the two-term
   equations) — the unit tests compare the two on random inputs.
 
-`decimal digits` note: p ≡ 3 (mod 4), so `sqrt` is a single exponentiation.
+For speed, FEDDEG_EC_BACKEND=auto uses OpenSSL if available; python forces the
+reference path, openssl requires native support. _openssl.py only replaces
+mul/mul_add/decompress, not verification rules. No Russian crypto stack or
+Cython build is required. All arithmetic here is VARIABLE-TIME: public inputs
+only; do not reuse these functions for signing or generating secret nonces.
+
+Independent review checklist:
+* Check p,q are prime and a=p-3,b=166,G=(1,GY). Check G is on the curve and
+  q*G=infinity WITHOUT first reducing the scalar mod q. Calling mul(G,Q) is
+  NOT an order test: it reduces Q to zero! Tests use raw affine additions.
+  Since q is prime, G!=infinity and qG=infinity, q divides #E; the Hasse
+  interval permits only the multiple q, hence cofactor=1. Thus a finite
+  on-curve point is already in the prime-order subgroup on THIS fixed curve.
+* Affine law is y²=x³+a*x+b mod p. Jacobian (X,Y,Z) means (X/Z²,Y/Z³), Z=0
+  denotes infinity. Test infinity, doubling, equal/opposite points, negative
+  and zero scalars, and full-width scalars against the independent affine law.
+* Compressed points are prefix 02/03 plus x_BE32. Reject x>=p and nonsquares;
+  p mod 4=3 permits sqrt via exponent (p+1)/4. Select the requested y parity.
+  LE64 decoding is x_LE32||y_LE32, with both coordinates <p. Never reduce
+  noncanonical incoming coordinates to silently accept a different encoding.
+* Scalar multiplication reduces modulo q only for INTERNAL arithmetic. The
+  signature/proof verifiers must reject out-of-range wire scalars themselves.
+  Infinity may occur in sums/intermediate equations but is not an encoded
+  public key in this profile. generator_walk batch-inverts only nonzero Zs.
+  Precomputation caches are bounded and immutable, never cached verdicts.
 """
 
 from __future__ import annotations
+
+import os
+from functools import lru_cache
+
+_native = None
+BACKEND = "python"
 
 P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFD97
 A = P - 3                      # a = -3 mod p
@@ -39,7 +76,8 @@ def is_on_curve(point: Point) -> bool:
     if point is None:
         return True
     x, y = point
-    return (y * y - x * x * x - A * x - B) % P == 0
+    return (0 <= x < P and 0 <= y < P and
+            (y * y - x * x * x - A * x - B) % P == 0)
 
 
 # ------------------------------------------------------------------ affine ---
@@ -89,7 +127,7 @@ def _from_jacobian(point: tuple[int, int, int]) -> Point:
     x, y, z = point
     if z == 0:
         return None
-    z_inv = pow(z, P - 2, P)
+    z_inv = pow(z, -1, P)
     z_inv2 = z_inv * z_inv % P
     return x * z_inv2 % P, y * z_inv2 % P * z_inv % P
 
@@ -98,12 +136,11 @@ def _jac_double(point: tuple[int, int, int]) -> tuple[int, int, int]:
     x, y, z = point
     if z == 0 or y == 0:
         return _J_INF
-    xx = x * x % P
     yy = y * y % P
     yyyy = yy * yy % P
     zz = z * z % P
-    s = 2 * ((x + yy) ** 2 - xx - yyyy) % P
-    m = (3 * xx + A * zz * zz) % P          # a = p − 3
+    s = 4 * x * yy % P
+    m = 3 * (x - zz) * (x + zz) % P        # 3X² + aZ⁴, specialized to a = −3
     x3 = (m * m - 2 * s) % P
     return x3, (m * (s - x3) - 8 * yyyy) % P, 2 * y * z % P
 
@@ -138,21 +175,23 @@ def _jac_add(p1: tuple[int, int, int], p2: tuple[int, int, int]) -> tuple[int, i
 
 
 _WINDOW = 4
-_TABLE_BITS = 4
 
 
-def _window_table(point: Point) -> list[tuple[int, int, int]]:
+@lru_cache(maxsize=128)
+def _window_table(point: Point) -> tuple[tuple[int, int, int], ...]:
     """[𝒪, P, 2P, …, (2^w − 1)P] in Jacobian coordinates."""
     table = [_J_INF, _to_jacobian(point)]
     double = _jac_double(table[1])
     for index in range(2, 1 << _WINDOW):
         table.append(_jac_add(table[index - 1], table[1]) if index != 2
                      else double)
-    return table
+    return tuple(table)  # Immutable, bounded cache; repeated public keys are common.
 
 
 def mul(point: Point, scalar: int) -> Point:
-    """Windowed scalar multiplication (w = 4), Jacobian coordinates."""
+    """Public scalar multiplication; native or w=4 Jacobian reference path."""
+    if _native is not None:
+        return _native.mul(point, scalar)
     if point is None:
         return None
     scalar %= Q
@@ -183,17 +222,8 @@ def sub(p1: Point, p2: Point) -> Point:
 
 
 def mul_small(point: Point, scalar: int) -> Point:
-    """Multiplication by a small scalar (plaintext values in the proofs)."""
-    if point is None or scalar == 0:
-        return None
-    result: Point = None
-    addend = point
-    while scalar:
-        if scalar & 1:
-            result = add(result, addend)
-        addend = add(addend, addend)
-        scalar >>= 1
-    return result
+    """Compatibility helper; use the same modulo-q rules even for negatives."""
+    return mul(point, scalar)
 
 
 def add_many(points) -> Point:
@@ -206,6 +236,8 @@ def add_many(points) -> Point:
 
 def mul_add(a: int, p1: Point, b: int, p2: Point) -> Point:
     """a·P₁ + b·P₂ with one doubling chain (Shamir's trick)."""
+    if _native is not None:
+        return _native.mul_add(a, p1, b, p2)
     a %= Q
     b %= Q
     if p1 is None or a == 0:
@@ -232,26 +264,12 @@ def mul_add(a: int, p1: Point, b: int, p2: Point) -> Point:
 
 G: Point = (GX, GY)
 
-_GENERATOR_TABLE = _window_table(G) if False else None      # built lazily below
-
-
 def mul_generator(scalar: int) -> Point:
-    """Fixed-base multiplication with a cached table."""
-    global _GENERATOR_TABLE
-    if _GENERATOR_TABLE is None:
-        _GENERATOR_TABLE = _window_table(G)
+    """Fixed-base multiplication; mul() shares the bounded precomputation cache."""
     scalar %= Q
-    if scalar == 0:
-        return None
-    result = _J_INF
-    for shift in range(((scalar.bit_length() + _WINDOW - 1) // _WINDOW) * _WINDOW - _WINDOW,
-                       -1, -_WINDOW):
-        for _ in range(_WINDOW):
-            result = _jac_double(result)
-        digit = (scalar >> shift) & ((1 << _WINDOW) - 1)
-        if digit:
-            result = _jac_add(result, _GENERATOR_TABLE[digit])
-    return _from_jacobian(result)
+    if scalar == 1:
+        return G
+    return mul(G, scalar)
 
 
 def decompress(data: bytes) -> Point:
@@ -261,6 +279,8 @@ def decompress(data: bytes) -> Point:
     x = int.from_bytes(data[1:], "big")
     if x >= P:
         raise ValueError("x out of range")
+    if _native is not None:
+        return _native.decompress(data)
     value = (pow(x, 3, P) + A * x + B) % P
     y = pow(value, (P + 1) // 4, P)          # p ≡ 3 (mod 4)
     if y * y % P != value:
@@ -309,7 +329,7 @@ def generator_walk(limit: int):
             if cursor[2]:
                 product = product * cursor[2] % P
             cursor = _jac_add(cursor, generator)
-        inverse = pow(product, P - 2, P)
+        inverse = pow(product, -1, P)
         affine = [None] * len(batch)
         for index in range(len(batch) - 1, -1, -1):
             x, y, z = batch[index]
@@ -319,3 +339,29 @@ def generator_walk(limit: int):
                 zi2 = zi * zi % P
                 affine[index] = (x * zi2 % P, y * zi2 * zi % P)
         yield from affine
+
+
+def check_generator_order() -> bool:
+    """Raw q*G check; deliberately bypass scalar reduction in all mul helpers."""
+    result = _J_INF
+    for bit in bin(Q)[2:]:
+        result = _jac_double(result)
+        if bit == "1":
+            result = _jac_add(result, _to_jacobian(G))
+    return is_on_curve(G) and G is not None and result[2] == 0
+
+
+# Optional acceleration is selected once per process (also on spawn-based pools).
+# Missing native support may fall back; arithmetic/runtime failures never do.
+_requested_backend = os.environ.get("FEDDEG_EC_BACKEND", "auto")
+if _requested_backend not in {"auto", "python", "openssl"}:
+    raise ValueError("FEDDEG_EC_BACKEND must be auto, python or openssl")
+if _requested_backend != "python":
+    try:
+        from ._openssl import OpenSSLCurve
+        _native = OpenSSLCurve(P, A, B, Q, G)
+    except (OSError, AttributeError) as error:
+        if _requested_backend == "openssl":
+            raise RuntimeError("requested OpenSSL EC backend is unavailable") from error
+    else:
+        BACKEND = "openssl"

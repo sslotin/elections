@@ -4,6 +4,15 @@ The raw dump interleaves transactions from many contracts, so a verifier has
 to retain some state per election.  It does *not* need to retain the complete
 transaction history: state writes, the set of voter keys, and one Jacobian
 homomorphic accumulator per ciphertext cell are sufficient for this audit.
+
+The equations, paper citations and acceptance/trust-boundary checklist are in
+protocol.py's top comment and the primitive modules it references. This driver
+must enforce the SAME checks and verdict as protocol.audit; tests run both on
+the same public exports. Only accepted, unique ballots enter the accumulator;
+workers return proof results, not trusted totals. Drain every outstanding
+worker before checking the full sum. Never certify a partial/empty input or
+count a failed election as both failed and incomplete. Raw JSON conversion
+is transport parsing, NOT verification of block signatures or state execution.
 """
 
 from __future__ import annotations
@@ -16,8 +25,9 @@ import sys
 import time
 import zipfile
 from concurrent.futures import Future, ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Generator, Iterator
 
 from tqdm import tqdm
 
@@ -88,20 +98,29 @@ def transaction_from_raw(outer: dict) -> protocol.Transaction | None:
 ProgressCallback = Callable[[int], None]
 
 
+def _is_jsonl_input(name: str) -> bool:
+    """Recognize raw dump members, but not the collector's state metadata."""
+    name = name.lower()
+    return (Path(name).name != "state.json"
+            and name.endswith((".json", ".jsonl", ".json.gz", ".jsonl.gz")))
+
+
 def dump_size(path: Path) -> int | None:
     """Return the uncompressed JSONL size when it is cheaply knowable."""
     path = Path(path)
     if path.is_dir():
-        return sum(
-            child.stat().st_size for child in path.iterdir()
-            if child.is_file() and child.suffix.lower() in {".json", ".jsonl"}
-        )
+        members = [child for child in path.iterdir()
+                   if child.is_file() and _is_jsonl_input(child.name)]
+        if any(member.name.lower().endswith(".gz") for member in members):
+            return None
+        return sum(child.stat().st_size for child in members)
     if path.suffix.lower() == ".zip":
         with zipfile.ZipFile(path) as archive:
-            return sum(
-                info.file_size for info in archive.infolist()
-                if not info.is_dir() and Path(info.filename).suffix.lower() in {".json", ".jsonl"}
-            )
+            members = [info for info in archive.infolist()
+                       if not info.is_dir() and _is_jsonl_input(info.filename)]
+            if any(info.filename.lower().endswith(".gz") for info in members):
+                return None
+            return sum(info.file_size for info in members)
     if path.suffix.lower() == ".gz":
         # gzip does not expose the uncompressed size without reading it.
         return None
@@ -109,7 +128,8 @@ def dump_size(path: Path) -> int | None:
 
 
 def _stream_text(binary, progress: ProgressCallback | None = None,
-                 offset: int = 0) -> Iterator[str]:
+                 offset: int = 0) -> Generator[str, None, int]:
+    """Yield decoded lines and return the uncompressed member length."""
     with io.TextIOWrapper(binary, encoding="utf-8") as text:
         for line in text:
             if progress is not None:
@@ -118,23 +138,28 @@ def _stream_text(binary, progress: ProgressCallback | None = None,
                 except (AttributeError, OSError):
                     pass
             yield line
+        return binary.tell()
 
 
 def iter_dump_lines(path: Path, progress: ProgressCallback | None = None) -> Iterator[str]:
-    """Stream JSONL and report uncompressed byte position to ``progress``."""
+    """Stream JSONL chunks (including gzip chunks) in filename order."""
     path = Path(path)
     if path.is_dir():
         members = sorted(
             child for child in path.iterdir()
-            if child.is_file() and child.suffix.lower() in {".json", ".jsonl"}
+            if child.is_file() and _is_jsonl_input(child.name)
         )
         if not members:
             raise ValueError(f"no JSONL chunks found in {path}")
         offset = 0
         for member in members:
-            with member.open("rb") as binary:
-                yield from _stream_text(binary, progress, offset)
-            offset += member.stat().st_size
+            if member.name.lower().endswith(".gz"):
+                with gzip.open(member, "rb") as binary:
+                    member_size = yield from _stream_text(binary, progress, offset)
+            else:
+                with member.open("rb") as binary:
+                    member_size = yield from _stream_text(binary, progress, offset)
+            offset += member_size
             if progress is not None:
                 progress(offset)
         return
@@ -143,16 +168,20 @@ def iter_dump_lines(path: Path, progress: ProgressCallback | None = None) -> Ite
         with zipfile.ZipFile(path) as archive:
             members = sorted(
                 (info for info in archive.infolist()
-                 if not info.is_dir() and Path(info.filename).suffix.lower() in {".json", ".jsonl"}),
+                 if not info.is_dir() and _is_jsonl_input(info.filename)),
                 key=lambda info: info.filename,
             )
             if not members:
                 raise ValueError(f"no JSONL member found in {path}")
             offset = 0
             for info in members:
-                with archive.open(info, "r") as binary:
-                    yield from _stream_text(binary, progress, offset)
-                offset += info.file_size
+                with archive.open(info, "r") as compressed:
+                    if info.filename.lower().endswith(".gz"):
+                        with gzip.GzipFile(fileobj=compressed, mode="rb") as binary:
+                            member_size = yield from _stream_text(binary, progress, offset)
+                    else:
+                        member_size = yield from _stream_text(compressed, progress, offset)
+                offset += member_size
                 if progress is not None:
                     progress(offset)
         return
@@ -182,6 +211,7 @@ def check_ballot(
         "tx_signatures": True,
         "range_proofs": check_proofs,
         "blind_signatures": check_ballot_checks,
+        "ballot_structure": check_ballot_checks,
     })
     ballot = protocol._ballot(
         tx, main_key, blind_key, dimension, local, DST_BLIND_ROP,
@@ -193,15 +223,18 @@ def check_ballot(
 class BallotScheduler:
     """Bounded optional process pool for independent ballot checks.
 
-    The default is deliberately synchronous.  The expensive EC arithmetic is
-    pure Python and does not benefit from Python threads; processes are used
-    when ``--workers`` is greater than one.  At most two batches per worker
+    The default is deliberately synchronous. Processes also accelerate the
+    Python fallback and parsing; each starts its own optional native EC backend
+    when ``--workers`` is greater than one. At most two ballots per worker
     are in flight, so the raw dump is never accumulated in memory.
     """
 
     def __init__(self, workers: int) -> None:
         self.workers = workers
-        self.pool = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
+        # tqdm can start a monitor thread before the first submission. Forking
+        # then risks inherited locks/native contexts; spawn is portable and clean.
+        self.pool = (ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"))
+                     if workers > 1 else None)
         self.queue: collections.deque[tuple["Election", Future]] = collections.deque()
         self.active = 0
 
@@ -260,18 +293,24 @@ class Election:
     """Minimal in-memory state needed to audit one contract."""
 
     def __init__(self, contract: str, check_proofs: bool,
-                 check_ballot_checks: bool, verify_tx_signatures: bool) -> None:
+                 check_ballot_checks: bool, verify_tx_signatures: bool, *,
+                 results_only: bool = False,
+                 excluded_ballots: dict[str, str] | None = None) -> None:
         self.result = protocol.AuditResult(
             contract=contract,
             enabled_checks={
                 "tx_signatures": verify_tx_signatures,
                 "range_proofs": check_proofs,
                 "blind_signatures": check_ballot_checks,
+                "ballot_structure": check_ballot_checks,
             },
         )
         self.check_proofs = check_proofs
         self.check_ballot_checks = check_ballot_checks
         self.verify_tx_signatures = verify_tx_signatures
+        self.results_only = results_only
+        self.excluded_ballots = excluded_ballots or {}
+        self.results_seen = False
         self.state: dict = {}
         self.seen_voters: set[str] = set()
         self.pending_votes: list[protocol.Transaction] = []
@@ -327,6 +366,20 @@ class Election:
         for entry in tx.diff:
             self.state[entry["key"]] = protocol._entry_value(entry)
 
+    def ready_to_finalize(self) -> bool:
+        """Wait for RESULTS and both decryption shares, which may follow it."""
+        has_master = any(
+            key.startswith("DECRYPTION_") and not key.startswith("DECRYPTION_FAIL")
+            for key in self.state
+        )
+        return self.results_seen and has_master and "COMMISSION_DECRYPTION" in self.state
+
+    def ballot_aggregate_complete(self) -> bool:
+        """In results-only mode, allow only explicitly excluded ballots to be absent."""
+        expected = self.result.accepted - len(self.result.excluded_ballots)
+        return (self.result.valid_bulletins == expected and
+                (self.results_only or expected == self.result.accepted))
+
     def _verify_transaction(self, tx: protocol.Transaction) -> None:
         try:
             if int(tx.fee) != 0:
@@ -374,6 +427,8 @@ class Election:
         if self.verify_tx_signatures:
             self._verify_transaction(tx)
         self.apply_state(tx)
+        if tx.operation == "results" and "RESULTS" in self.state:
+            self.results_seen = True
         try:
             self.flush_pending(scheduler)
         except protocol.INPUT_ERRORS as error:
@@ -396,6 +451,9 @@ class Election:
             self.result.revotes.append(tx.tx_id)
             return
         self.seen_voters.add(tx.sender)
+        if self.results_only and tx.tx_id in self.excluded_ballots:
+            self.result.excluded_ballots[tx.tx_id] = self.excluded_ballots[tx.tx_id]
+            return
         try:
             self._submit_vote(tx, scheduler)
         except protocol.INPUT_ERRORS as error:
@@ -403,8 +461,16 @@ class Election:
 
     def apply_ballot(self, ballot, local: protocol.AuditResult) -> None:
         """Merge a synchronous or worker result into this election."""
-        for name in ("bad_blind_signature", "bad_shape", "bad_zkp", "notes"):
-            getattr(self.result, name).extend(getattr(local, name))
+        if self.results_only:
+            self.result.notes.extend(local.notes)
+            if ballot is None:
+                for tx_id in local.bad_shape + local.bad_zkp + local.bad_blind_signature:
+                    reason = next((note for note in local.notes if tx_id in note),
+                                  "could not decode ballot for aggregation")
+                    self.result.excluded_ballots.setdefault(tx_id, reason)
+        else:
+            for name in ("bad_blind_signature", "bad_shape", "bad_zkp", "notes"):
+                getattr(self.result, name).extend(getattr(local, name))
         self.result.ballot_zkp_seconds += local.ballot_zkp_seconds
         self.result.ballot_zkp_checks += local.ballot_zkp_checks
         if ballot is None:
@@ -449,9 +515,10 @@ class Election:
             if not isinstance(base, dict):
                 raise ValueError("malformed VOTING_BASE")
 
-            if self.result.valid_bulletins != self.result.accepted:
+            if not self.ballot_aggregate_complete():
                 self.result.notes.append(
-                    "full-election decryption/tally not checked because a ballot failed"
+                    "full-election decryption/tally not checked because included ballots "
+                    "do not reconcile with accepted votes and explicit exclusions"
                 )
                 return self.result
 
@@ -543,9 +610,11 @@ class Election:
 
 
 class StreamVerifier:
-    def __init__(self, workers: int, results_only: bool) -> None:
+    def __init__(self, workers: int, results_only: bool,
+                 excluded_ballots: dict[str, str] | None = None) -> None:
         self.scheduler = BallotScheduler(workers)
         self.results_only = results_only
+        self.excluded_ballots = excluded_ballots or {}
         self.elections: dict[str, Election] = {}
         self.completed: list[protocol.AuditResult] = []
         self.blocks = 0
@@ -565,15 +634,17 @@ class StreamVerifier:
             check_ballot_checks = not self.results_only
             election = self.elections[contract] = Election(
                 contract, check_ballot_checks, check_ballot_checks,
-                not self.results_only,
+                not self.results_only, results_only=self.results_only,
+                excluded_ballots=self.excluded_ballots,
             )
         return election
 
     def _emit(self, result: protocol.AuditResult) -> None:
-        if result.verdict == "failed":
+        if self.results_only and result.final_result_verified:
+            status = (f"RESULTS VERIFIED (ballot checks skipped; "
+                      f"excluded={len(result.excluded_ballots)})")
+        elif result.verdict == "failed":
             status = "FAILED"
-        elif self.results_only and result.final_result_verified:
-            status = "RESULTS VERIFIED (all signatures/checks skipped)"
         elif result.verdict == "verified":
             status = "VERIFIED"
         else:
@@ -587,14 +658,22 @@ class StreamVerifier:
             len(result.wrong_tx_signature), len(result.bad_blind_signature),
             len(result.bad_shape), len(result.bad_zkp), len(result.revotes),
         )
+        ballot_counts = (
+            f"accepted={result.accepted}; included_in_sum={result.valid_bulletins}; "
+            f"excluded={len(result.excluded_ballots)}"
+            if self.results_only else
+            f"accepted={result.accepted}; valid_ballots={result.valid_bulletins}"
+        )
         self._write(
             f"{result.contract}: {status}; transactions={result.transactions}; "
-            f"accepted={result.accepted}; valid_ballots={result.valid_bulletins}; "
-            f"ballot_zkp={zkp_time}; aggregation={result.aggregation_seconds:.3f}s; "
+            f"{ballot_counts}; ballot_zkp={zkp_time}; "
+            f"aggregation={result.aggregation_seconds:.3f}s; "
             f"final_result={result.result_phase_seconds:.3f}s; "
             f"results_match={result.results_match}; "
             f"problems(tx/blind/shape/zkp/revote)={problems}"
         )
+        for tx_id, reason in sorted(result.excluded_ballots.items()):
+            self._write(f"  excluded ballot: {tx_id}; reason={reason}")
         for note in result.notes:
             self._write(f"  note: {note}")
         self.completed.append(result)
@@ -661,28 +740,37 @@ class StreamVerifier:
                         self.input_anomalies += 1
                         self._write(
                             f"input anomaly: transaction {tx.tx_id} for {contract} "
-                            "appeared after results"
+                            "appeared after results/decryption finalization"
+                        )
+                        continue
+                    if (election.results_seen and
+                            tx.operation not in {"decryption", "commissionDecryption"}):
+                        self.input_anomalies += 1
+                        self._write(
+                            f"input anomaly: transaction {tx.tx_id} for {contract} "
+                            f"({tx.operation}) appeared after RESULTS"
                         )
                         continue
                     if tx.operation == "vote":
                         bar.set_description(
                             "checking ballot (ZKP)" if not self.results_only
-                            else "aggregating ciphertexts"
+                            else "aggregating ciphertexts",
+                            refresh=False,
                         )
                     elif tx.operation == "results":
-                        bar.set_description("checking final result")
+                        bar.set_description("checking final result", refresh=False)
                     else:
                         bar.set_description(
                             "checking transaction" if not self.results_only
-                            else "replaying state"
+                            else "replaying state",
+                            refresh=False,
                         )
                     election.process(tx, self.scheduler)
-                    # Results is the contract's terminal state operation in the
-                    # published dump.  Finalizing here releases voter-key and
-                    # accumulator memory before the next elections complete.
-                    if tx.operation == "results":
+                    # Decryption shares can follow RESULTS in the dump. Finalize
+                    # only once the result and both shares have been replayed.
+                    if election.ready_to_finalize():
                         self.finish_election(contract)
-                    bar.set_description("reading dump")
+                    bar.set_description("reading dump", refresh=False)
                 if self.blocks % 5000 == 0:
                     self._write(
                         f"read blocks={self.blocks:,}; contract_transactions="
@@ -701,20 +789,27 @@ class StreamVerifier:
 
         failed = sum(result.verdict == "failed" for result in self.completed)
         incomplete = sum(
-            (result.verdict != "verified") if not self.results_only
-            else not result.final_result_verified
+            result.verdict != "failed" and (
+                result.verdict != "verified" if not self.results_only
+                else not result.final_result_verified)
             for result in self.completed
         )
         verified = len(self.completed) - failed - incomplete
+        excluded = sum(len(result.excluded_ballots) for result in self.completed)
         self._write(
             f"finished: elections={len(self.completed):,}; verified={verified:,}; "
             f"failed={failed:,}; incomplete={incomplete:,}; "
-            f"input_anomalies={self.input_anomalies:,}"
+            f"excluded_ballots={excluded:,}; input_anomalies={self.input_anomalies:,}"
         )
-        return 1 if failed or self.input_anomalies else (2 if incomplete else 0)
+        if not self.completed:
+            self._write("incomplete: no elections found")
+        return 1 if failed or self.input_anomalies else (2 if incomplete or not self.completed else 0)
 
 
-def verify(path: Path, *, workers: int = 1, results_only: bool = False) -> int:
+def verify(path: Path, *, workers: int = 1, results_only: bool = False,
+           excluded_ballots: dict[str, str] | None = None) -> int:
     if workers < 1:
         raise ValueError("workers must be positive")
-    return StreamVerifier(workers, results_only).run(Path(path))
+    if excluded_ballots and not results_only:
+        raise ValueError("ballot exclusions are only supported with results_only=True")
+    return StreamVerifier(workers, results_only, excluded_ballots).run(Path(path))

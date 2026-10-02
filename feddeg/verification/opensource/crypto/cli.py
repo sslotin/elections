@@ -33,9 +33,9 @@ def cmd_vectors(_args) -> int:
 
     # curve sanity: 2·P and the order
     double = curve.add(curve.G, curve.G)
-    print("2·P on curve:", curve.is_on_curve(double),
-          "| order·P = 𝒪:", curve.mul(curve.G, curve.Q) is None)
-    failures += not curve.is_on_curve(double) or curve.mul(curve.G, curve.Q) is not None
+    order_ok = curve.check_generator_order()  # mul(G,Q) would reduce Q to zero first.
+    print("2·P on curve:", curve.is_on_curve(double), "| order·P = 𝒪:", order_ok)
+    failures += not curve.is_on_curve(double) or not order_ok
     print("compress/decompress round trip:",
           curve.decompress(curve.compress(double)) == double)
     failures += curve.decompress(curve.compress(double)) != double
@@ -47,7 +47,7 @@ def cmd_vectors(_args) -> int:
     failures += len(digest) != 48
 
     # the hash-to-scalar of the proofs must agree with the published TS/C
-    print("points_hash(𝒪-only case) is stable:",
+    print("points_hash(G, 2G) returns an integer:",
           isinstance(hashfn.points_hash([curve.G, double]), int))
     print("FAILURES:", failures)
     return 1 if failures else 0

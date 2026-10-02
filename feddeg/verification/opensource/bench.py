@@ -10,13 +10,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import platform
+import sys
 import time
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+sys.dont_write_bytecode = True
 
 from crypto import bulletin, curve, elgamal, gost3410, protocol, tezhu, zkp
 from crypto.hashfn import DST_BLIND_ROP
@@ -37,19 +36,21 @@ CORPUS = {
 }
 
 SERIES = (
-    ("range", "Range proof\nбюллетеней"),
-    ("tx", "GOST-подписи\nтранзакций"),
-    ("blind", "TeZhu blind\nподписи"),
+    ("range", "Доказательства\nдиапазона"),
+    ("tx", "ГОСТ-подписи\nтранзакций"),
+    ("blind", "Слепые подписи\nTeZhu"),
     ("add", "Агрегация\nшифротекстов"),
-    ("decryption", "DLEQ partial\nрасшифровка"),
-    ("dlp", "DLP / tally"),
-    ("key_agg", "Key aggregation"),
+    ("decryption", "Доказательства\nрасшифровки"),
+    ("dlp", "Восстановление итогов"),
+    ("key_agg", "Агрегация ключей"),
 )
 
 
 def default_fixture() -> Path:
     """Locate the small immutable fixture in the surrounding verification tree."""
     candidates = (
+        Path(__file__).resolve().parents[3]
+        / "data/verification-fixtures/4BbdvzVdbyQES6ARbt4YDB4htfUYgwUVGpQYNa6dLj3u.zip",
         Path(__file__).resolve().parents[4]
         / "verification/tests/fixtures/4BbdvzVdbyQES6ARbt4YDB4htfUYgwUVGpQYNa6dLj3u.zip",
         Path(__file__).resolve().parents[1]
@@ -66,7 +67,8 @@ def default_fixture() -> Path:
 def timed(function, repeats: int) -> float:
     started = time.perf_counter()
     for _ in range(repeats):
-        function()
+        if function() is False:
+            raise ValueError("benchmark check failed; refusing to time invalid proofs")
     return (time.perf_counter() - started) / repeats
 
 
@@ -102,7 +104,14 @@ def load_seed(path: Path) -> dict:
         False, False, False,
     )
     accumulator = elgamal.CiphertextAccumulator([len(q) for q in ballot])
-    accumulator.add(ballot)
+    # Final decryption proofs bind the WHOLE election, even with --fixture pointing
+    # at an export larger than the one-vote default. Timing a failed proof lies.
+    for accepted in (tx for tx in transactions if tx.accepted_vote()):
+        cells = protocol._ballot(accepted, main_key, blind_key, dimension,
+                                 protocol.AuditResult(), DST_BLIND_ROP, False, False, False)
+        if cells is None:
+            raise ValueError("benchmark fixture contains a malformed ballot")
+        accumulator.add(cells)
     summed = accumulator.finish()
     master, commission = protocol._decryption_tables(state)
     pk1 = curve.decompress(bytes.fromhex(state["DKG_KEY"]))
@@ -190,6 +199,8 @@ def benchmark(seed: dict, repeats: int) -> dict[str, float]:
             repeats,
         ),
     }
+    # Keep raw seconds as well as the legacy corpus projection (CPU hours).
+    per_check = {f"{key}_seconds": value for key, value in measurements.items()}
     measurements["range"] = (
         measurements["option_proof"] * CORPUS["option_proof_cells"]
         + measurements["sum_proof"] * CORPUS["sum_proof_cells"]
@@ -204,10 +215,15 @@ def benchmark(seed: dict, repeats: int) -> dict[str, float]:
     )
     measurements["dlp"] = measurements["dlp_step"] * CORPUS["dlp_steps"] / 3600
     measurements["key_agg"] = measurements["key_agg"] * CORPUS["elections"] / 3600
+    measurements.update(per_check)
     return measurements
 
 
 def make_chart(costs: dict[str, float], output: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     labels = [label for key, label in SERIES]
     values = [costs[key] for key, _ in SERIES]
     total = sum(values)
@@ -225,13 +241,13 @@ def make_chart(costs: dict[str, float], output: Path) -> None:
     )
     ax.legend(
         wedges,
-        [f"{label.replace(chr(10), ' ')} — {value:.3g} h" for label, value in zip(labels, values)],
+        [f"{label.replace(chr(10), ' ')} — {value:.3g} ч" for label, value in zip(labels, values)],
         title=f"Итого: {total:.3g} CPU-ч",
         loc="center left",
         bbox_to_anchor=(0.98, 0.5),
         fontsize=9,
     )
-    ax.set_title("Оценка времени полной проверки EDG 2025\n(малый фактический benchmark)")
+    ax.set_title("Оценка времени полной проверки ЕДГ-2025\n(замер на малой контрольной выгрузке)")
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -252,17 +268,28 @@ def main() -> int:
         default=Path(__file__).with_name("pie-chart.png"),
         help="output PNG (default: pie-chart.png next to this script)",
     )
+    parser.add_argument("--no-plot", action="store_true", help="do not import matplotlib or write a chart")
+    parser.add_argument("--json", type=Path, help="write timings and backend metadata to this path")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     fixture = args.fixture or default_fixture()
     seed = load_seed(fixture)
     costs = benchmark(seed, args.repeats)
-    print(f"seed={fixture}")
+    print(f"seed={fixture}; backend={curve.BACKEND}; repeats={args.repeats}")
+    print(f"option proof: {costs['option_proof_seconds'] * 1000:.3f} ms; "
+          f"sum proof: {costs['sum_proof_seconds'] * 1000:.3f} ms")
     print("measured/projected CPU hours:")
     for key, _ in SERIES:
         print(f"  {key:12} {costs[key]:.6g}")
-    make_chart(costs, args.output)
+    if args.json:
+        args.json.write_text(json.dumps({
+            "backend": curve.BACKEND, "python": platform.python_version(),
+            "platform": platform.platform(), "fixture": str(fixture),
+            "repeats": args.repeats, "measurements": costs,
+        }, indent=2) + "\n", encoding="utf-8")
+    if not args.no_plot:
+        make_chart(costs, args.output)
     return 0
 
 

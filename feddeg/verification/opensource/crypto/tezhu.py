@@ -1,9 +1,13 @@
 """BS — схема подписи вслепую (§2.3 протокола).
 
 protocol2023.pdf, §2.3: "Схема подписи вслепую 𝐵𝑆 определяется следующими
-процессами (используется схема, определенная в работе [9])" — the TeZhu scheme of
+процессами (используется схема, определенная в работе [9])". This is a typo in
+the PDF: TeZhu is reference [10]; [9] is Shamir secret sharing.
 Tessaro & Zhu, "Short Pairing-Free Blind Signatures with Exponential Security"
-(EUROCRYPT 2022), with
+(EUROCRYPT 2022), §5.1, BS3.Ver (Fig. 7 of ePrint 2022/047):
+https://doi.org/10.1007/978-3-031-07085-3_27
+https://eprint.iacr.org/2022/047.pdf
+The two-key/four-scalar scheme is BS3, NOT the three-scalar BS1. It uses
 
     Hash_blind(m) = Hash(m, DST_blind),
     DST_blind = «BlindSign-TeZhu-V00-H2F:id-tc26-gost-3410-2012-256-paramSetB_Streebog-256_XMD_RO».
@@ -23,6 +27,29 @@ form and the 130-byte blob used by the implementation are accepted.
 
 The protocol DST ends with _XMD_RO. RFC 9380 appends its length (80 = ASCII
 "P") to form DST_prime; `dst=` takes that already-suffixed byte string.
+
+Independent check: translate the paper's multiplicative g,X,Z into additive
+G,Q,Z. Then g^s X^(-cy) becomes mul_add(s,G,-c*y,Q), and g^t Z^y becomes
+mul_add(t,G,y,Z). Decode c,s,y,t as LE32 without reducing them first; require
+0<c,y<q and 0<=s,t<q (PDF Verify additionally excludes c=0). Reject infinity
+for reconstructed A,C because this wire profile has no infinity encoding.
+Hash exactly LE64(A)||LE64(C)||message using hashfn.xmd_ro, BIG-endian OS2IP
+of its 48-byte result, reduced mod q. The caller passes UTF8(senderPublicKey),
+NOT the Base58-decoded key bytes, as message. Compare that scalar with c.
+
+The two-byte key header is transport metadata, not a signed/domain-bound part
+of BS3. Left-padding short signatures is an observed integer-export convention;
+it must be done to the entire signature BEFORE splitting into LE scalars.
+Cross-check wire details with the pinned deg2025 source's
+observer-tools/src/utils/tezhu.ts and deg-hash.ts (revision in zkp.py).
+Positive tests can choose a,b,x,z,y, set A=aG,C=bG, c=H(A,C,m), then
+s=a+c*y*x and t=b-y*z modulo q; mutate message and each scalar separately.
+
+A valid signature certifies only possession of an issuer-authorized message.
+It does NOT prove voter identity/eligibility, one issuance per person, or
+unlinkability of the live issuer. The paper's blindness/unforgeability claims
+assume its interactive protocol, group and random-oracle/AGM assumptions;
+a verification-only implementation cannot establish these deployment facts.
 """
 
 from __future__ import annotations
@@ -64,7 +91,7 @@ def verify(public_key: bytes, message: bytes, signature: bytes, *,
     y = int.from_bytes(signature[64:96], "little")
     t = int.from_bytes(signature[96:128], "little")
 
-    if not (0 <= c < curve.Q and 0 <= s < curve.Q and
+    if not (0 < c < curve.Q and 0 <= s < curve.Q and
             0 < y < curve.Q and 0 <= t < curve.Q):
         return False
     a_point = curve.mul_add(s, curve.G, -c * y, q_point)

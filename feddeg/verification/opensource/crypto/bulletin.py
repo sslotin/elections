@@ -9,7 +9,27 @@ implementations / chain format:
   only lists the fields of 𝑡𝑥, not their serialisation.
 
 Keeping them in one module makes the boundary between "specified by the
-protocol" and "chain plumbing" explicit.
+protocol" and "chain plumbing" explicit. This is serialization, not a new
+cryptographic construction; the GOST paper/standard does not define these bytes.
+
+Independent review sources: protobuf wire specification,
+https://protobuf.dev/programming-guides/encoding/; the public implementation
+https://github.com/cikrf/deg2025/tree/d1fc451622342990e436afdc5849e6e9969f62c7/observer-tools/src
+(utils/get-tx-bytes.ts and utils/byte-utils.ts for transaction bytes; the
+Bulletin schema is consumed by the worker's protobuf decoder). Compare
+transaction fields IN ORDER, widths, endianness, type/version-specific suffixes,
+Base58 leading zeros, and signed-string UTF8 bytes, not just parsed JSON values.
+Our serializer supports only zero-fee exports; unsupported types/fees fail.
+
+The decoder checks length bounds and delegates cryptographic point/scalar
+validation to the primitive modules. Unknown protobuf fields are ignored for
+forward compatibility; repeated scalar fields use the last occurrence, like
+protobuf. It is not a canonical-protobuf validator. Signature verification is
+over the original bulletin bytes inside transaction parameters, never over a
+re-encoded object. Range proofs by themselves do not enforce question counts
+or sum linkage; protocol._ballot performs those checks. State diffs/acceptance
+markers are NOT part of this request signature: independently authenticate
+chain execution before treating these exported fields as authoritative.
 """
 
 from __future__ import annotations
@@ -25,6 +45,8 @@ def _varint(buf: bytes, pos: int) -> tuple[int, int]:
             raise ValueError("truncated or oversized protobuf varint")
         byte = buf[pos]
         pos += 1
+        if shift == 63 and byte > 1:  # The tenth byte has only one uint64 bit.
+            raise ValueError("oversized protobuf varint")
         value |= (byte & 0x7F) << shift
         if not byte & 0x80:
             return value, pos
