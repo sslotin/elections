@@ -78,7 +78,7 @@ python3 -B verify_archives.py 2024.zip 2025.zip --state /tmp/feddeg-archives-sta
 В начале каждого криптографического модуля есть ссылки на статьи, формулы,
 кодировки, условия отказа и порядок независимой проверки. Общий план — в
 [AUDIT.md](AUDIT.md), малые исходные выгрузки — в
-[`data/verification-fixtures`](../../../data/verification-fixtures/README.md).
+[`tests/fixtures`](tests/fixtures/README.md).
 
 **Важно:** обнаружены расхождения PDF и опубликованной реализации в порядке
 коэффициентов агрегации ключей и хэшируемых данных доказательства диапазона.

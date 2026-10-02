@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from crypto import bulletin, cli, curve, elgamal, hashfn, protocol, streebog, tezhu, zkp
 
-FIXTURES = Path(__file__).resolve().parents[4] / 'data/verification-fixtures'
+FIXTURES = Path(__file__).resolve().parent / 'fixtures'
 ONE = FIXTURES / '4BbdvzVdbyQES6ARbt4YDB4htfUYgwUVGpQYNa6dLj3u.zip'
 FOUR = FIXTURES / '9efgbWtn68NP41wXJutPMYgCLoUgnyEEZvpr9KgYVPb5.zip'
 

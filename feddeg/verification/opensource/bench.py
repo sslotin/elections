@@ -47,18 +47,11 @@ SERIES = (
 
 
 def default_fixture() -> Path:
-    """Locate the small immutable fixture in the surrounding verification tree."""
-    candidates = (
-        Path(__file__).resolve().parents[3]
-        / "data/verification-fixtures/4BbdvzVdbyQES6ARbt4YDB4htfUYgwUVGpQYNa6dLj3u.zip",
-        Path(__file__).resolve().parents[4]
-        / "verification/tests/fixtures/4BbdvzVdbyQES6ARbt4YDB4htfUYgwUVGpQYNa6dLj3u.zip",
-        Path(__file__).resolve().parents[1]
-        / "tests/fixtures/4BbdvzVdbyQES6ARbt4YDB4htfUYgwUVGpQYNa6dLj3u.zip",
-    )
-    for path in candidates:
-        if path.is_file():
-            return path
+    """Locate the small immutable fixture bundled with this verifier."""
+    path = (Path(__file__).resolve().parent / "tests" / "fixtures"
+            / "4BbdvzVdbyQES6ARbt4YDB4htfUYgwUVGpQYNa6dLj3u.zip")
+    if path.is_file():
+        return path
     raise FileNotFoundError(
         "small benchmark fixture not found; pass it explicitly with --fixture PATH"
     )
