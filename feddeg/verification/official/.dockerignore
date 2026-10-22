@@ -1,0 +1,9 @@
+.git
+__pycache__
+*.py[cod]
+
+# The bug image needs only bugs/; large unrelated dump adapters are excluded.
+dump_to_official.py
+make_batches.py
+test_data/
+unlinked_sum_proof/

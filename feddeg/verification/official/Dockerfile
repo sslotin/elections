@@ -52,7 +52,5 @@ RUN unzip -j cpblindsig.zip 'linux x64/libcpblindsig.so.*' \
 WORKDIR /app
 RUN npm ci --no-audit --no-fund && npm run build
 
-# The generated cases and their per-case READMEs are part of the image.
-COPY bugs /app/bugs
-
-ENTRYPOINT ["python3", "/app/bugs/run_cases.py", "--runtime", "/app"]
+# The image exposes the official CLI; callers pass `validate <contract-id>`.
+ENTRYPOINT ["node", "/app/dist/index.js"]
